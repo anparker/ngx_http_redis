@@ -24,6 +24,8 @@ typedef struct {
     ngx_int_t                  db;
     ngx_int_t                  auth;
     ngx_uint_t                 gzip_flag;
+    ngx_array_t               *redis_lengths;
+    ngx_array_t               *redis_values;
 } ngx_http_redis_loc_conf_t;
 
 
@@ -34,6 +36,8 @@ typedef struct {
 } ngx_http_redis_ctx_t;
 
 
+static ngx_int_t ngx_http_redis_eval(ngx_http_request_t *r,
+    ngx_http_redis_loc_conf_t *rlcf);
 static ngx_int_t ngx_http_redis_create_request(ngx_http_request_t *r);
 static ngx_int_t ngx_http_redis_reinit_request(ngx_http_request_t *r);
 static ngx_int_t ngx_http_redis_process_header(ngx_http_request_t *r);
@@ -193,40 +197,22 @@ ngx_http_redis_handler(ngx_http_request_t *r)
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
 
-#if defined nginx_version && nginx_version >= 8011
     if (ngx_http_upstream_create(r) != NGX_OK) {
-#else
-    rlcf = ngx_http_get_module_loc_conf(r, ngx_http_redis_module);
-
-    u = ngx_pcalloc(r->pool, sizeof(ngx_http_upstream_t));
-    if (u == NULL) {
-#endif
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
 
-#if defined nginx_version && nginx_version >= 8011
-    u = r->upstream;
-#endif
-
-#if defined nginx_version && nginx_version >= 8037
-    ngx_str_set(&u->schema, "redis://");
-#else
-    u->schema.len = sizeof("redis://") - 1;
-    u->schema.data = (u_char *) "redis://";
-#endif
-
-#if defined nginx_version && nginx_version >= 8011
-    u->output.tag = (ngx_buf_tag_t) &ngx_http_redis_module;
-#else
-    u->peer.log = r->connection->log;
-    u->peer.log_error = NGX_ERROR_ERR;
-#endif
-
-#if defined nginx_version && nginx_version >= 8011
     rlcf = ngx_http_get_module_loc_conf(r, ngx_http_redis_module);
-#else
+
+    if (rlcf->redis_lengths) {
+        if (ngx_http_redis_eval(r, rlcf) != NGX_OK) {
+            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        }
+    }
+
+    u = r->upstream;
+
+    ngx_str_set(&u->schema, "redis://");
     u->output.tag = (ngx_buf_tag_t) &ngx_http_redis_module;
-#endif
 
     u->conf = &rlcf->upstream;
 
@@ -235,10 +221,6 @@ ngx_http_redis_handler(ngx_http_request_t *r)
     u->process_header = ngx_http_redis_process_header;
     u->abort_request = ngx_http_redis_abort_request;
     u->finalize_request = ngx_http_redis_finalize_request;
-
-#if defined nginx_version && nginx_version < 8011
-    r->upstream = u;
-#endif
 
     ctx = ngx_palloc(r->pool, sizeof(ngx_http_redis_ctx_t));
     if (ctx == NULL) {
@@ -254,15 +236,59 @@ ngx_http_redis_handler(ngx_http_request_t *r)
     u->input_filter = ngx_http_redis_filter;
     u->input_filter_ctx = ctx;
 
-#if defined nginx_version && nginx_version >= 8011
     r->main->count++;
-#endif
 
     ngx_http_upstream_init(r);
 
     return NGX_DONE;
 }
 
+static ngx_int_t
+ngx_http_redis_eval(ngx_http_request_t *r, ngx_http_redis_loc_conf_t *rlcf)
+{
+    ngx_url_t             url;
+    ngx_http_upstream_t  *u;
+
+    ngx_memzero(&url, sizeof(ngx_url_t));
+
+    if (ngx_http_script_run(r, &url.url, rlcf->redis_lengths->elts, 0,
+                            rlcf->redis_values->elts)
+        == NULL)
+    {
+        return NGX_ERROR;
+    }
+
+    url.no_resolve = 1;
+
+    if (ngx_parse_url(r->pool, &url) != NGX_OK) {
+        if (url.err) {
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                          "%s in upstream \"%V\"", url.err, &url.url);
+        }
+
+        return NGX_ERROR;
+    }
+
+    u = r->upstream;
+
+    u->resolved = ngx_pcalloc(r->pool, sizeof(ngx_http_upstream_resolved_t));
+    if (u->resolved == NULL) {
+        return NGX_ERROR;
+    }
+
+    if (url.addrs) {
+        u->resolved->sockaddr = url.addrs[0].sockaddr;
+        u->resolved->socklen = url.addrs[0].socklen;
+        u->resolved->name = url.addrs[0].name;
+        u->resolved->naddrs = 1;
+    }
+
+    u->resolved->host = url.host;
+    u->resolved->port = url.port;
+    u->resolved->no_port = url.no_port;
+
+    return NGX_OK;
+}
 
 static ngx_int_t
 ngx_http_redis_create_request(ngx_http_request_t *r)
@@ -780,11 +806,7 @@ ngx_http_redis_create_loc_conf(ngx_conf_t *cf)
 
     conf = ngx_pcalloc(cf->pool, sizeof(ngx_http_redis_loc_conf_t));
     if (conf == NULL) {
-#if defined nginx_version && nginx_version >= 8011
         return NULL;
-#else
-        return NGX_CONF_ERROR;
-#endif
     }
 
     /*
@@ -840,6 +862,8 @@ ngx_http_redis_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_http_redis_loc_conf_t *prev = parent;
     ngx_http_redis_loc_conf_t *conf = child;
 
+    ngx_http_core_loc_conf_t  *clcf;
+
     ngx_conf_merge_msec_value(conf->upstream.connect_timeout,
                               prev->upstream.connect_timeout, 60000);
 
@@ -876,8 +900,13 @@ ngx_http_redis_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
         return NGX_CONF_ERROR;
     }
 
-    if (conf->upstream.upstream == NULL) {
+    clcf = ngx_http_conf_get_module_loc_conf(cf, ngx_http_core_module);
+
+    if (clcf->noname
+        && conf->upstream.upstream == NULL && conf->redis_lengths == NULL) {
         conf->upstream.upstream = prev->upstream.upstream;
+        conf->redis_lengths = prev->redis_lengths;
+        conf->redis_values = prev->redis_values;
     }
 
     if (conf->index == NGX_CONF_UNSET) {
@@ -899,24 +928,15 @@ ngx_http_redis_pass(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
     ngx_http_redis_loc_conf_t *rlcf = conf;
 
-    ngx_str_t                 *value;
+    ngx_str_t                 *value, *url;
     ngx_url_t                  u;
+    ngx_uint_t                 n;
     ngx_http_core_loc_conf_t  *clcf;
+    ngx_http_script_compile_t  sc;
+
 
     if (rlcf->upstream.upstream) {
         return "is duplicate";
-    }
-
-    value = cf->args->elts;
-
-    ngx_memzero(&u, sizeof(ngx_url_t));
-
-    u.url = value[1];
-    u.no_resolve = 1;
-
-    rlcf->upstream.upstream = ngx_http_upstream_add(cf, &u, 0);
-    if (rlcf->upstream.upstream == NULL) {
-        return NGX_CONF_ERROR;
     }
 
     clcf = ngx_http_conf_get_module_loc_conf(cf, ngx_http_core_module);
@@ -935,6 +955,40 @@ ngx_http_redis_pass(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
     rlcf->db = ngx_http_get_variable_index(cf, &ngx_http_redis_db);
     rlcf->auth = ngx_http_get_variable_index(cf, &ngx_http_redis_auth);
+
+    value = cf->args->elts;
+
+    url = &value[1];
+
+    n = ngx_http_script_variables_count(url);
+
+    if (n) {
+        ngx_memzero(&sc, sizeof(ngx_http_script_compile_t));
+
+        sc.cf = cf;
+        sc.source = url;
+        sc.lengths = &rlcf->redis_lengths;
+        sc.values = &rlcf->redis_values;
+        sc.variables = n;
+        sc.complete_lengths = 1;
+        sc.complete_values = 1;
+
+        if (ngx_http_script_compile(&sc) != NGX_OK) {
+            return NGX_CONF_ERROR;
+        }
+
+        return NGX_CONF_OK;
+    }
+
+    ngx_memzero(&u, sizeof(ngx_url_t));
+
+    u.url = value[1];
+    u.no_resolve = 1;
+
+    rlcf->upstream.upstream = ngx_http_upstream_add(cf, &u, 0);
+    if (rlcf->upstream.upstream == NULL) {
+        return NGX_CONF_ERROR;
+    }
 
     return NGX_CONF_OK;
 }

@@ -1,14 +1,18 @@
 nginx HTTP redis module
---
+=======================
+
+This is a fork of v0.3.9 with added ability to use variables in
+redis_pass directive. All changes are based on a code from official
+ngx_http_fastcgi module.
 
 Description:
 --
 
 The nginx HTTP redis module for caching with redis,
-http://code.google.com/p/redis/.
+https://www.nginx.com/resources/wiki/modules/redis/.
 
 The redis protocol
-(http://code.google.com/p/redis/wiki/ProtocolSpecification)
+(https://redis.io/topics/protocol)
 not yet fully implemented, but AUTH, GET and SELECT commands only.
 
 
